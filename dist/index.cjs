@@ -210,7 +210,41 @@ class ContractMap {
 	}
 }
 
+async function execCmd(cmd, args, env, log) {
+
+	console.log("EXEC", cmd, args);
+	let timer;
+	if (log) setTimeout(() => log(cmd, args), 5000); // TODO: make this customizable
+	return new Promise((ful, rej) => {
+		let proc = node_child_process.spawn(cmd, args, {encoding: 'utf8', env});
+		let stdout = '';
+		let stderr = '';
+		proc.stderr.on('data', chunk => {
+			stderr += chunk;
+			console.log("eCHUNK", chunk);
+
+	});
+		proc.stdout.on('data', chunk => {
+			console.log("CHUNK", chunk);
+			stdout += chunk;
+	});
+		proc.on('exit', code => {
+			try {
+				console.log("CODE", code);	
+				if (!code) {
+					return ful(stdout);
+				}
+			} catch (err) {
+			}
+			rej(error_with('unexpected output', {code, error: strip_ansi(stderr), cmd, args}));
+		});
+	}).finally(() => clearTimeout(timer));
+}
+
 async function exec_json(cmd, args, env, log) {
+
+	console.log("EXEC JSON", cmd, args);
+
 	let timer;
 	if (log) {
 		// TODO: make this customizable
@@ -244,6 +278,8 @@ async function exec_json(cmd, args, env, log) {
 			proc.stderr.on('data', chunk => stderr.push(chunk));
 			proc.on('close', code => {
 				if (code) {
+
+					console.log(stderr.toString('utf8'));
 					let error = Buffer.join(stderr).toString('utf8');
 					rej(new Error(`exit ${code}: ${strip_ansi(error)}`));
 				} else {
@@ -409,6 +445,9 @@ class FoundryBase {
 		let args = ['build', '--format-json', '--root', this.root];
 		if (force) args.push('--force');
 		let res = await exec_json(this.forge, args, {FOUNDRY_PROFILE: this.profile}, this.procLog);
+
+		console.log("RES", res);
+		
 		let errors = filter_errors(res.errors);
 		if (errors.length) {
 			throw error_with('forge build', {errors});
@@ -422,13 +461,19 @@ class FoundryBase {
 		file += '.sol'; // add extension
 		let tail = node_path.join(node_path.basename(file), `${contract}.json`);
 		let path = node_path.dirname(file);
+
 		while (true) {
+			console.log("PATH", path);
+
 			try {
 				let out_file = node_path.join(this.root, this.config.out, path, tail);
+				console.log("OUT FILE", out_file);
 				await promises.access(out_file);
 				return out_file;
 			} catch (err) {
 				let parent = node_path.dirname(path);
+				console.log("PARENT", parent);
+
 				if (parent === path) throw error_with('unknown contract', {file, contract});
 				path = parent;
 			}
@@ -494,6 +539,26 @@ class FoundryBase {
 }
 
 class Foundry extends FoundryBase {
+
+	static async launchLive({
+		provider,
+		wallets = [DEFAULT_WALLET],
+		chain,
+		procLog,
+		infoLog = true,
+		...rest
+	}) {
+		console.log("Launch live");
+		let self = await this.load(rest);
+		self.provider = provider;
+
+		return self;
+	}
+
+	isAnvil() {
+		return 'anvil' in this;
+	}
+
 	static async launch({
 		port = 0,
 		wallets = [DEFAULT_WALLET],
@@ -809,15 +874,47 @@ class Foundry extends FoundryBase {
 		this.accounts.set(c.target, c);
 		return c;
 	}
-	async deploy({from, args = [], libs = {}, silent, ...artifactLike}) {
-		let w = await this.ensureWallet(from || DEFAULT_WALLET);
+	async deploy({from, args = [], libs = {}, silent, prepend = '', ...artifactLike}) {
+		console.log("Hello");
+		let w = this.isAnvil() ? await this.ensureWallet(from || DEFAULT_WALLET) : from;
+		const { chainId } = await w.provider.getNetwork();
 		let {abi, links, bytecode: bytecode0, ...artifact} = await this.resolveArtifact(artifactLike);
+
+		if (!this.isAnvil()) {
+			const deployment = await loadDeployment(this.root, chainId, prepend, artifact.contract);
+
+			if (deployment && 'target' in deployment) {
+				const deployedContract = new ethers.ethers.Contract(deployment.target, deployment.abi.fragments, w);
+
+				deployedContract.already = true;
+				deployedContract.constructorArgs = deployment.constructorArgs;
+
+				return deployedContract;
+			}
+		}
+
 		let {bytecode, linked} = this.linkBytecode(bytecode0, links, libs);
 		let factory = new ethers.ethers.ContractFactory(abi, bytecode, w);
 		let unsigned = await factory.getDeployTransaction(...args);
 		let tx = await w.sendTransaction(unsigned);
 		let receipt = await tx.wait();
+
+		//Save deployment data for live deployments
+		if (!this.isAnvil()) {
+			const contractData = {
+				"name": artifact.contract, 
+				"target": receipt.contractAddress, 
+				"abi": abi, 
+				"bytecode": bytecode, 
+				"links": linked, 
+				"receipt": receipt, 
+				"constructorArgs": args
+			};
+			await saveDeployment(this.root, chainId, prepend, contractData);
+		}
+
 		let c = new ethers.ethers.Contract(receipt.contractAddress, abi, w);
+		c["constructorArgs"] = args;
 		c[_NAME] = `${artifact.contract}<${take_hash(c.target)}>`; // so we can deploy the same contract multiple times
 		c[_OWNER] = this;
 		c.toString = get_NAME;
@@ -880,6 +977,29 @@ function extract_links(linkReferences) {
 			return {file, contract, offsets};
 		});
 	});
+}
+
+console.log("Hello");
+async function saveDeployment(root, chainId, savePrepend, data) {
+
+	let src = node_path.join(root, 'deployments', chainId.toString());
+	console.log("Saving src", src);
+	await promises.mkdir(src, {recursive: true});
+	let file = node_path.join(src, `${savePrepend}${data.name}.json`);
+	await promises.writeFile(file, JSON.stringify(data));
+}
+
+
+async function loadDeployment(root, chainId, savePrepend, name) {
+	let file = node_path.join(root, 'deployments', chainId.toString(), `${savePrepend}${name}.json`);
+	console.log("Reading src", file);
+
+	try {
+		let data = await promises.readFile(file);
+		return JSON.parse(data);
+	} catch (e) {
+		return false;
+	}
 }
 
 function split(s) {
@@ -1130,5 +1250,6 @@ exports.Node = Node;
 exports.Resolver = Resolver;
 exports.compile = compile;
 exports.error_with = error_with;
+exports.execCmd = execCmd;
 exports.is_address = is_address;
 exports.to_address = to_address;
