@@ -30,6 +30,7 @@ function to_address(x) {
 		if (is_address(x)) return x;
 		if (is_address(x.target)) return x.target;
 		if (is_address(x.address)) return x.address;
+		if (is_address(x.contractAddress)) return x.address;
 	}
 }
 
@@ -530,7 +531,7 @@ class FoundryBase extends EventEmitter {
 		let map = new ContractMap();
 		for (let [cid, impl] of Object.entries(libs)) {
 			let address = to_address(impl);
-			if (!address) throw error_with(`unable to determine library address: ${file}`, {file, impl});
+			if (!address) throw error_with(`unable to determine library address:`, {impl});
 			map.add(cid, address);
 		}
 		let linked = Object.fromEntries(links.map(link => {
