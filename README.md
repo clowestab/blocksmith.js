@@ -2,7 +2,7 @@
 
 ⚠️ This repo is under active development!
 
-`$ npm i @adraffy/blocksmith` [&check;](https://www.npmjs.com/package/@adraffy/blocksmith)
+`npm i @adraffy/blocksmith` [&check;](https://www.npmjs.com/package/@adraffy/blocksmith)
 
 * see [**types**](./dist/index.d.ts) / designed for [Foundry](https://github.com/foundry-rs/foundry) + [ethers](https://github.com/ethers-io/ethers.js).
 * compatible with any async test runner, including [node:test](https://nodejs.org/api/test.html)
@@ -23,7 +23,7 @@
 * [resolverworks/**TheOffchainResolver.sol**](https://github.com/resolverworks/TheOffchainResolver.sol/blob/main/test/test.js)
 * [resolverworks/**XCTENS.sol**](https://github.com/resolverworks/XCTENS.sol/blob/main/test/test.js)
 * [resolverworks/**OffchainNext.sol**](https://github.com/resolverworks/OffchainNext.sol/blob/main/test/test.js)
-* [unruggable-labs/**evmgateway-v2**](https://github.com/unruggable-labs/evmgateway-v2/)
+* [unruggable-labs/**unruggable-gateways**](https://github.com/unruggable-labs/unruggable-gateways/)
 * [unruggable-labs/**Storage.sol**](https://github.com/unruggable-labs/Storage.sol)
 * [adraffy/**CCIPRewriter.sol**](https://github.com/adraffy/CCIPRewriter.sol)
 * [adraffy/**punycode.sol**](https://github.com/adraffy/punycode.sol)
@@ -32,3 +32,7 @@
 
 * [`Node`](./src/Node.js) is client-side scaffolding to manage name/label/namehash/labelhash which simplifies many ENS-related functions that require a variety of inputs.
 * [`Resolver`](./src/Resolver.js) is a [**TOR**](https://github.com/resolverworks/TheOffchainResolver.sol)-aware [ENSIP-10](https://docs.ens.domains/ensip/10) resolver implementation.
+
+### Funding Support
+
+* Received [GG20 ENS Retro Grant](https://discuss.ens.domains/t/gg20-ens-identity-round-conclusion/19301) from Arbitrum DAO, Gitcoin, SpruceID, and ThankARB

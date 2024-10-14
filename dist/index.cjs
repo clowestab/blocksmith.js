@@ -8,6 +8,7 @@ var node_path = require('node:path');
 var node_os = require('node:os');
 var node_util = require('node:util');
 var node_console = require('node:console');
+var EventEmitter = require('node:events');
 
 function error_with(message, params, cause) {
 	let error;
@@ -157,10 +158,11 @@ const TAG_STOP    = ansi('93', 'STOP');
 const DEFAULT_WALLET = 'admin';
 const DEFAULT_PROFILE = 'default';
 
-const _OWNER = Symbol('blocksmith');
-const _NAME  = Symbol('blocksmith.name');
+const Symbol_foundry = Symbol('blocksmith');
+const Symbol_name  = Symbol('blocksmith.name');
+const Symbol_makeErrors = Symbol('blocksmith.makeError');
 function get_NAME() {
-	return this[_NAME];
+	return this[Symbol_name];
 }
 
 function take_hash(s) {
@@ -243,13 +245,7 @@ async function execCmd(cmd, args, env, log) {
 
 async function exec_json(cmd, args, env, log) {
 
-	console.log("EXEC JSON", cmd, args);
-
-	let timer;
-	if (log) {
-		// TODO: make this customizable
-		timer = setTimeout(() => log(cmd, args), 3000);
-	}
+	log?.(cmd, args, env);
 	// 20240905: bun bug
 	// https://github.com/oven-sh/bun/issues/13755
 	// this fix is absolute garbage
@@ -263,59 +259,70 @@ async function exec_json(cmd, args, env, log) {
 	// 	stdout[1] = chunk;
 	// }
 	// 20240905: just use file until theres a proper fix
-	let temp_dir;
-	let temp_fh;
+	// https://github.com/oven-sh/bun/issues/4798
+	// 20240914: had to revert this fix as it causes more bugs than it fixes
+	// https://github.com/oven-sh/bun/issues/13972
+	// 20240921: another attempt to fix this bun shit
+	// just yolo swap the buffers if it parses incorrectly
 	try {
-		temp_dir = await promises.mkdtemp(node_path.join(node_os.tmpdir(), 'blocksmith-'));
-		let temp_file = node_path.join(temp_dir, 'stdout.txt');
-		temp_fh = await promises.open(temp_file, 'w');
-		await new Promise((ful, rej) => {
+		let stdout = await new Promise((ful, rej) => {
 			let proc = node_child_process.spawn(cmd, args, {
 				env: {...process.env, ...env}, 
-				stdio: ['ignore', temp_fh.fd, 'pipe']
+				stdio: ['ignore', 'pipe', 'pipe'],
 			});
+			let stdout = [];
 			let stderr = [];
+			proc.stdout.on('data', chunk => stdout.push(chunk));
 			proc.stderr.on('data', chunk => stderr.push(chunk));
 			proc.on('close', code => {
 				if (code) {
-
-					console.log(stderr.toString('utf8'));
-					let error = Buffer.join(stderr).toString('utf8');
-					rej(new Error(`exit ${code}: ${strip_ansi(error)}`));
+					let error = Buffer.concat(stderr).toString('utf8');
+					error = strip_ansi(error);
+					error = error.replaceAll(/^Error:/g, '');
+					error = error.trim();
+					// 20240916: put more info in message since bun errors are dogshit
+					rej(new Error(`${cmd}: ${error} (code=${code})`));
 				} else {
-					ful();
+					//ful(Buffer.concat(stdout));
+					ful(stdout);
 				}
 			});
 		});
 		try {
-			// how the fuck can this throw bad file descriptor if i opened it?! 
-			// https://github.com/oven-sh/bun/issues/4798
-			await temp_fh.close();
-		} catch (err) {
+			return JSON.parse(Buffer.concat(stdout));
+		} catch (bug) {
+			if (stdout.length > 1) {
+				let v = stdout.slice();
+				v[0] = stdout[1];
+				v[1] = stdout[0];
+				return JSON.parse(Buffer.concat(v));
+			}
+			throw bug;
 		}
-		return JSON.parse(await promises.readFile(temp_file));
 	} catch (err) {
 		throw Object.assign(err, {cmd, args, env});
-	} finally {
-		clearTimeout(timer);
-		try {
-			// clean up since logs can be very large
-			await promises.rm(temp_dir, {recursive: true, force: true});
-		} catch (err) {
-		}
 	}
 }
 
-async function compile(sol, {contract, foundry, optimize, smart = true} = {}) {
+async function compile(sol, options = {}) {
+	let {
+		contract,
+		foundry, 
+		optimize, 
+		autoHeader = true, 
+		solcVersion, 
+		evmVersion,
+		viaIR
+	} = options;
 	if (Array.isArray(sol)) {
 		sol = sol.join('\n');
 	}
 	if (!contract) {
-		let match = sol.match(/contract\s([a-z$_][0-9a-z$_]*)/i);
+		let match = sol.match(/(contract|library)\s([a-z$_][0-9a-z$_]*)/i);
 		if (!match) throw error_with('expected contract name', {sol});
-		contract = match[1];
+		contract = match[2];
 	}
-	if (smart) {
+	if (autoHeader) {
 		if (!/^\s*pragma\s+solidity/m.test(sol)) {
 			sol = `pragma solidity >=0.0.0;\n${sol}`;
 		}
@@ -372,10 +379,14 @@ async function compile(sol, {contract, foundry, optimize, smart = true} = {}) {
 			config.optimizer_runs = optimize; // TODO: parse?
 		}
 	}
+	if (solcVersion) config.solc_version = solcVersion;
+	if (evmVersion) config.evm_version = evmVersion;
+	if (viaIR !== undefined) config.via_ir = !!viaIR;
+
 	await promises.writeFile(config_file, encode({profile: {[DEFAULT_PROFILE]: config}}));
 	args.push('--config-path', config_file);
 
-	let res = await exec_json(foundry?.forge ?? 'forge', args, env);
+	let res = await exec_json(foundry?.forge ?? 'forge', args, env, foundry?.procLog);
 	let errors = filter_errors(res.errors);
 	if (errors.length) {
 		throw error_with('forge build', {sol, errors});
@@ -397,16 +408,20 @@ async function compile(sol, {contract, foundry, optimize, smart = true} = {}) {
 		}
 	}
 	let {contract: {abi, evm}} = info;
-	abi = ethers.ethers.Interface.from(abi);
+	abi = abi_from_solc_json(abi);
 	let bytecode = '0x' + evm.bytecode.object;
 	let links = extract_links(evm.bytecode.linkReferences);
 	//let deployedBytecode = '0x' + evm.deployedBytecode.object; // TODO: decide how to do this
-	let deployedByteCount = evm.deployedBytecode.object.length >> 1;
-	return {abi, bytecode, contract, origin, links, sol, deployedByteCount, root};
+	//let deployedByteCount = evm.deployedBytecode.object.length >> 1;
+	// 20241002: do this is general with a decompiler
+	return {abi, bytecode, contract, origin, links, sol, root};
 }
 
 // should this be called Foundry?
-class FoundryBase {
+class FoundryBase extends EventEmitter {
+	constructor() {
+		super();
+	}
 	static profile() {
 		return process.env.FOUNDRY_PROFILE ?? DEFAULT_PROFILE;
 	}
@@ -452,6 +467,7 @@ class FoundryBase {
 		if (errors.length) {
 			throw error_with('forge build', {errors});
 		}
+		this.emit('built');
 		return this.built = {date: new Date()};
 	}
 	async find({file, contract}) {
@@ -472,41 +488,42 @@ class FoundryBase {
 				return out_file;
 			} catch (err) {
 				let parent = node_path.dirname(path);
-				console.log("PARENT", parent);
-
-				if (parent === path) throw error_with('unknown contract', {file, contract});
+				if (parent === path) throw error_with(`unknown contract: ${file}:${contract}`, {file, contract});
 				path = parent;
 			}
 		}
 	}
-	async resolveArtifact(args) {
-		let {import: imported, sol, bytecode, abi, file, contract, ...rest} = args;
+	compile(sol, options = {}) {
+		return compile(sol, {...options, foundry: this});
+	}
+	resolveArtifact(arg0) {
+		let {import: imported, bytecode, abi, sol, file, contract, ...rest} = arg0;
 		if (imported) {
 			sol = `import "${imported}";`;
-			contract = remove_sol_ext(node_path.basename(imported));
+			contract ??= remove_sol_ext(node_path.basename(imported));
+			rest.autoHeader = true; // force it
 		}
-		if (bytecode) {
-			if (!contract) contract = 'Unnamed';
-			abi = ethers.ethers.Interface.from(abi);
-			return {abi, bytecode, contract, origin: 'Bytecode', links: []}
-		} else if (sol) {
-			// TODO: should this be .compile?
+		if (bytecode) { // bytecode + abi
+			contract ??= 'Unnamed';
+			abi = iface_from(abi ?? []);
+			return {abi, bytecode, contract, origin: 'Bytecode', links: []};
+		} else if (sol) { // sol code + contract?
 			return compile(sol, {contract, foundry: this, ...rest});
-		} else if (file) {
+		} else if (file) { // file + contract?
 			return this.fileArtifact({file, contract});
 		}
-		throw error_with('unknown artifact', args);
+		throw error_with('unknown artifact', arg0);
 	}
 	// async compileArtifact({sol, contract, ...rest}) {
 	// 	return compile(sol, {contract, rest})
 	// }
-	async fileArtifact(args) {
-		let file = await this.find(args);
+	async fileArtifact(arg0) {
+		let file = await this.find(arg0);
 		let artifact = JSON.parse(await promises.readFile(file));
 		let [origin, contract] = Object.entries(artifact.metadata.settings.compilationTarget)[0]; // TODO: is this correct?
 		let bytecode = artifact.bytecode.object;
 		let links = extract_links(artifact.bytecode.linkReferences);
-		let abi = ethers.ethers.Interface.from(artifact.abi);
+		let abi = abi_from_solc_json(artifact.abi);
 		return {abi, bytecode, contract, origin, file, links};
 	}
 	linkBytecode(bytecode, links, libs) {
@@ -538,6 +555,10 @@ class FoundryBase {
 	// }
 }
 
+function has_key(x, key) {
+	return typeof x === 'object' && x !== null && key in x;
+}
+
 class Foundry extends FoundryBase {
 
 	static async launchLive({
@@ -559,6 +580,11 @@ class Foundry extends FoundryBase {
 		return 'anvil' in this;
 	}
 
+	static of(x) {
+		if (!has_key(x, Symbol_foundry)) throw new TypeError(`expected Contract or Wallet`);
+		return x[Symbol_foundry];
+	}
+
 	static async launch({
 		port = 0,
 		wallets = [DEFAULT_WALLET],
@@ -574,7 +600,6 @@ class Foundry extends FoundryBase {
 		...rest
 	} = {}) {
 		let self = await this.load(rest);
-
 		if (!infoLog) infoLog = undefined;
 		if (!procLog) procLog = undefined;
 		if (infoLog === true) infoLog = console.log.bind(console);
@@ -605,12 +630,18 @@ class Foundry extends FoundryBase {
 			} else if (gasLimit) {
 				args.push('--gas-limit', gasLimit);
 			}
-			if (fork) args.push('--fork-url', fork);
-			let proc = node_child_process.spawn(anvil, args, {env: {...process.env, RUST_LOG: 'node=info'}});
-			proc.stdin.end();
+			if (fork) {
+				fork = String(fork);
+				args.push('--fork-url', fork);
+			}
+			let proc = node_child_process.spawn(anvil, args, {
+				env: {...process.env, RUST_LOG: 'node=info'},
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
 			const fail = data => {
 				proc.kill();
-				rej(error_with('launch', {args, stderr: data.toString()}));
+				let error = strip_ansi(data.toString()).trim();
+				rej(error_with('launch', {args, error}));
 			};
 			proc.stderr.once('data', fail);
 			let lines = [];
@@ -653,9 +684,12 @@ class Foundry extends FoundryBase {
 						if (match) {
 							let [_, time, _level, kind, line] = match;
 							if (kind === 'node::user') {
+								// note: this gets all fucky when weaving promises
+								// but i dont know of any work around until this is fixed
 								show_log = line !== 'eth_estimateGas';
 							} else if (kind === 'node::console') {
 								if (show_log) {
+									self.emit('console', line);
 									infoLog(TAG_CONSOLE, time, line);
 								}
 								return;
@@ -668,20 +702,22 @@ class Foundry extends FoundryBase {
 				port = parseInt(host.slice(host.lastIndexOf(':') + 1));
 				let provider = new ethers.ethers.WebSocketProvider(endpoint, chain, {staticNetwork: true});
 				//let provider = new ethers.IpcSocketProvider('/tmp/anvil.ipc', chain, {staticNetwork: true});
-				if (!chain) {
-					chain = parseInt(await provider.send('eth_chainId')); // determine chain id
-				}
+				chain ??= parseInt(await provider.send('eth_chainId')); // determine chain id
 				let automine = await provider.send('anvil_getAutomine');
 				if (automine) {
 					provider.destroy();
 					provider = new ethers.ethers.WebSocketProvider(endpoint, chain, {staticNetwork: true, cacheTimeout: -1});
 				}
-				Object.assign(self, {proc, provider, infoLog, procLog, endpoint, chain, port, automine, anvil});
+				Object.assign(self, {proc, provider, infoLog, procLog, endpoint, chain, port, automine, anvil, fork});
 				wallets = await Promise.all(wallets.map(x => self.ensureWallet(x)));
 				if (infoLog) {
 					const t = Date.now();
 					infoLog(TAG_START, self.pretty({chain, endpoint, wallets}));
-					proc.once('exit', () => infoLog(TAG_STOP, `${ansi('33', Date.now() - t)}ms`)); // TODO fix me
+					proc.once('exit', () => {
+						const uptime = Date.now() - t;
+						self.emit('shutdown', uptime);
+						infoLog(TAG_STOP, `${ansi('33', uptime)}ms`); // TODO fix me
+					});
 				}
 				ful(self);
 			}
@@ -692,24 +728,79 @@ class Foundry extends FoundryBase {
 		this.accounts = new Map();
 		this.write_map = new Map();
 		this.event_map = new Map();
-		this.error_map = new Map();
+		const error_map = this.error_map = new Map();
 		this.wallets = {};
+		this.error_fixer = function(data, tx) {
+			const error0 = this[Symbol_makeErrors](data, tx);
+			if (!error0.reason) {
+				let bucket = error_map.get(ethers.ethers.dataSlice(data, 0, 4));
+				if (bucket) {
+					for (let abi of bucket.values()) {
+						let error = abi.makeError(data, tx);
+						if (error.reason) {
+							error.invocation ??= error0.invocation;
+							return error;
+						}
+					}
+				}
+			}
+			return error0;
+		};
+		this.shutdown = () => {
+			if (!this.killed) {
+				this.killed = new Promise(ful => {
+					this.provider.destroy();
+					this.proc.once('exit', ful);
+					this.proc.kill();
+				});
+			}
+			return this.killed;
+		};
 	}
-	async shutdown() {
-		return new Promise(ful => {
-			this.provider.destroy();
-			this.proc.once('exit', ful);
-			this.proc.kill();
-		});
+	nextBlock(n = 1) {
+		return this.provider.send('anvil_mine', [ethers.ethers.toBeHex(n)]);
 	}
-	async nextBlock(n = 1) {
-		await this.provider.send('anvil_mine', [ethers.ethers.toBeHex(n)]);
+	setStorageValue(a, slot, value) {
+		if (value instanceof Uint8Array) {
+			if (value.length != 32) throw new TypeError(`expected exactly 32 bytes`);
+			value = ethers.ethers.hexlify(value);
+		} else {
+			value = ethers.ethers.toBeHex(value, 32);
+		}
+		return this.provider.send('anvil_setStorageAt', [to_address(a), ethers.ethers.toBeHex(slot, 32), value]);
+	}
+	setStorageBytes(a, slot, v) {
+		// TODO: this does not cleanup (zero higher slots)
+		a = to_address(a);
+		v = ethers.ethers.getBytes(v);
+		if (v.length < 32) {
+			let u = new Uint8Array(32);
+			u.set(v);
+			u[31] = v.length << 1;
+			return this.setStorageValue(a, slot, u);
+		}
+		slot = BigInt(slot);
+		let ps = [this.setStorageValue(a, slot, (v.length << 1) | 1)];
+		let off = BigInt(ethers.ethers.solidityPackedKeccak256(['uint256'], [slot]));
+		let pos = 0;
+		while (pos < v.length) {
+			let end = pos + 32;
+			if (end > v.length) {
+				let u = new Uint8Array(32);
+				u.set(v.subarray(pos));
+				ps.push(this.setStorageValue(a, off, u));
+				break;
+			}
+			ps.push(this.setStorageValue(a, off++, v.subarray(pos, end)));
+			pos = end;
+		}
+		return Promise.all(ps);
 	}
 	requireWallet(...xs) {
 		for (let x of xs) {
 			if (!x) continue;
 			if (x instanceof ethers.ethers.Wallet) {
-				if (x[_OWNER] === this) return x;
+				if (x[Symbol_foundry] === this) return x;
 				throw error_with('unowned wallet', {wallet: x});
 			}
 			let address = to_address(x);
@@ -724,7 +815,7 @@ class Foundry extends FoundryBase {
 		}
 		throw new Error('missing required wallet');
 	}
-	async createWallet({prefix = 'random', ...a} = {}) {
+	createWallet({prefix = 'random', ...a} = {}) {
 		let id = 0;
 		while (true) {
 			let name = `${prefix}${++id}`; // TODO fix O(n)
@@ -745,8 +836,8 @@ class Foundry extends FoundryBase {
 			if (ether > 0) {
 				await this.provider.send('anvil_setBalance', [wallet.address, ethers.ethers.toBeHex(ether * BigInt(1e18))]);
 			}
-			wallet[_NAME] = x;
-			wallet[_OWNER] = this;
+			wallet[Symbol_name] = x;
+			wallet[Symbol_foundry] = this;
 			wallet.toString = get_NAME;
 			this.wallets[x] = wallet;
 			this.accounts.set(wallet.address, wallet);
@@ -756,10 +847,10 @@ class Foundry extends FoundryBase {
 	pretty(x) {
 		if (x) {
 			if (typeof x === 'object') {
-				if (_OWNER in x) {
+				if (Symbol_foundry in x) {
 					return {
 						[node_util.inspect.custom]() { 
-							return ansi('35', x[_NAME]);
+							return ansi('35', x[Symbol_name]);
 						}
 					};
 				} else if (x instanceof ethers.ethers.Indexed) {
@@ -810,13 +901,9 @@ class Foundry extends FoundryBase {
 	async confirm(p, {silent, ...extra} = {}) {
 		let tx = await p;
 		let receipt = await tx.wait();
-		let args = {gas: receipt.gasUsed, ...extra};
+		let desc = this.parseTransaction(tx);
 		if (!silent && this.infoLog) {
-			// let contract = this.accounts.get(receipt.to);
-			// if (contract instanceof ethers.BaseContract) {
-
-			// }
-			let desc = this.parseTransaction(tx);
+			let args = {gas: receipt.gasUsed, ...extra};
 			let action;
 			if (desc) {
 				Object.assign(args, desc.args.toObject());
@@ -837,6 +924,7 @@ class Foundry extends FoundryBase {
 			}
 			this._dump_logs(receipt);
 		}
+		this.emit('tx', tx, receipt, desc);
 		return receipt;
 	}
 	_dump_logs(receipt) {
@@ -846,14 +934,6 @@ class Foundry extends FoundryBase {
 			if (abi) {
 				event = abi.parseLog(x);
 			}
-			/*
-			for (let c of this.accounts.values()) {
-				if (c instanceof ethers.BaseContract) {
-					log = c.interface.parseLog(x);
-					if (log) break;
-				}
-			}
-			*/
 			if (event) {
 				if (event.args.length) {
 					this.infoLog(TAG_EVENT, event.signature, this.pretty(event.args.toObject()));
@@ -864,27 +944,43 @@ class Foundry extends FoundryBase {
 		}
 	}
 	async deployed({from, at, ...artifactLike}) {
+		// TODO: expose this
 		let w = await this.ensureWallet(from || DEFAULT_WALLET);
 		let {abi, ...artifact} = await this.resolveArtifact(artifactLike);
 		let c = new ethers.ethers.Contract(at, abi, w);
-		c[_NAME] = `${artifact.contract}<${take_hash(c.target)}>`; 
-		c[_OWNER] = this;
+		c[Symbol_name] = `${artifact.contract}<${take_hash(c.target)}>`; 
+		c[Symbol_foundry] = this;
 		c.toString = get_NAME;
 		c.__artifact = artifact;
 		this.accounts.set(c.target, c);
 		return c;
 	}
-	async deploy({from, args = [], libs = {}, silent, prepend = '', ...artifactLike}) {
-		console.log("Hello");
-		let w = this.isAnvil() ? await this.ensureWallet(from || DEFAULT_WALLET) : from;
-		const { chainId } = await w.provider.getNetwork();
-		let {abi, links, bytecode: bytecode0, ...artifact} = await this.resolveArtifact(artifactLike);
+
+	async deploy(arg0) {
+		if (typeof arg0 === 'string') {
+			arg0 = arg0.startsWith('0x') ? {bytecode: arg0} : {sol: arg0};
+		}
+		let {
+			from = DEFAULT_WALLET, 
+			args = [], 
+			libs = {}, 
+			abis = [], 
+			silent = false, 
+			parseAllErrors = true, 
+			prepend = '',
+			...artifactLike
+		} = arg0;
+		from = this.isAnvil() ? await this.ensureWallet(from) : from;
+		const { chainId } = await from.provider.getNetwork();
+		let {abi, links, bytecode: bytecode0, origin, contract} = await this.resolveArtifact(artifactLike);
+		abi = mergeABI(abi, ...abis);
+		if (parseAllErrors) abi = this.parseAllErrors(abi);
 
 		if (!this.isAnvil()) {
-			const deployment = await loadDeployment(this.root, chainId, prepend, artifact.contract);
+			const deployment = await loadDeployment(this.root, chainId, prepend, contract);
 
 			if (deployment && 'target' in deployment) {
-				const deployedContract = new ethers.ethers.Contract(deployment.target, deployment.abi.fragments, w);
+				const deployedContract = new ethers.ethers.Contract(deployment.target, deployment.abi.fragments, from);
 
 				deployedContract.already = true;
 				deployedContract.constructorArgs = deployment.constructorArgs;
@@ -894,15 +990,15 @@ class Foundry extends FoundryBase {
 		}
 
 		let {bytecode, linked} = this.linkBytecode(bytecode0, links, libs);
-		let factory = new ethers.ethers.ContractFactory(abi, bytecode, w);
+		let factory = new ethers.ethers.ContractFactory(abi, bytecode, from);
 		let unsigned = await factory.getDeployTransaction(...args);
-		let tx = await w.sendTransaction(unsigned);
+		let tx = await from.sendTransaction(unsigned);
 		let receipt = await tx.wait();
 
 		//Save deployment data for live deployments
 		if (!this.isAnvil()) {
 			const contractData = {
-				"name": artifact.contract, 
+				"name": contract, 
 				"target": receipt.contractAddress, 
 				"abi": abi, 
 				"bytecode": bytecode, 
@@ -913,16 +1009,14 @@ class Foundry extends FoundryBase {
 			await saveDeployment(this.root, chainId, prepend, contractData);
 		}
 
-		let c = new ethers.ethers.Contract(receipt.contractAddress, abi, w);
+		let c = new ethers.ethers.Contract(receipt.contractAddress, abi, from);
 		c["constructorArgs"] = args;
-		c[_NAME] = `${artifact.contract}<${take_hash(c.target)}>`; // so we can deploy the same contract multiple times
-		c[_OWNER] = this;
+		c[Symbol_name] = `${contract}<${take_hash(c.target)}>`; // so we can deploy the same contract multiple times
+		c[Symbol_foundry] = this;
 		c.toString = get_NAME;
-		c.__artifact = artifact;
-		c.__receipt = receipt;
-
 		let code = ethers.ethers.getBytes(await this.provider.getCode(c.target));
-		//c.__bytecode = code;
+		c.__info = {contract, origin, code, libs: linked, from};
+		c.__receipt = receipt;
 		this.accounts.set(c.target, c);
 		abi.forEachFunction(f => {
 			if (f.constant) return;
@@ -943,24 +1037,69 @@ class Foundry extends FoundryBase {
 			bucket.set(ethers.ethers.id(e.format('sighash')), abi);
 		});
 		if (!silent && this.infoLog) {
-			// let stats = {
-			// 	gas: Number(receipt.gasUsed),
-			// 	bytes: code.length,
-			// };
 			let stats = [
 				`${ansi('33', receipt.gasUsed)}gas`, 
 				`${ansi('33', code.length)}bytes`
 			];
 			if (Object.keys(linked).length) {
-				//stats.links = Object.fromEntries(links.map(x => [x.contract, x.address]));
 				stats.push(this.pretty(linked));
 			}
-			 // {address, gas: receipt.gasUsed, size: code.length});
-			this.infoLog(TAG_DEPLOY, this.pretty(w), artifact.origin, this.pretty(c), ...stats);
+			this.infoLog(TAG_DEPLOY, this.pretty(from), origin, this.pretty(c), ...stats);
 			this._dump_logs(receipt);
 		}
+		this.emit('deploy', c); // tx, receipt?
 		return c;
 	}
+	parseAllErrors(abi) {
+		if (abi.makeError !== this.error_fixer) {
+			abi[Symbol_makeErrors] = abi.makeError.bind(abi);
+			abi.makeError = this.error_fixer;
+		}
+		return abi;
+	}
+}
+
+function abi_from_solc_json(json) {
+	// purge stuff that ethers cant parse
+	// TODO: check that this is an external library
+	// https://github.com/ethereum/solidity/issues/15470
+	let v = [];
+	for (let x of json) {
+		try {
+			v.push(ethers.ethers.Fragment.from(x));
+		} catch (err) {
+		}
+	}
+	return new ethers.ethers.Interface(v);
+}
+
+function iface_from(x) {
+	return x instanceof ethers.ethers.BaseContract ? x.interface : ethers.ethers.Interface.from(x);
+}
+
+function mergeABI(...a) {
+	if (a.length < 2) return iface_from(a[0] ?? []);
+	let unique = new Map();
+	let extra = [];
+	a.forEach((x, i) => {
+		for (let f of iface_from(x).fragments) {
+			switch (f.type) {
+				case 'constructor':
+				case 'fallback':
+					if (!i) extra.push(f);
+					break;
+				case 'function':
+				case 'event':
+				case 'error': // take all
+					let key = `${f.type}:${f.format()}`;
+					if (key && !unique.has(key)) {
+						unique.set(key, f);
+					}
+					break;
+			}
+		}
+	});
+	return new ethers.ethers.Interface([...extra, ...unique.values()]);
 }
 
 function filter_errors(errors) {
@@ -1252,4 +1391,5 @@ exports.compile = compile;
 exports.error_with = error_with;
 exports.execCmd = execCmd;
 exports.is_address = is_address;
+exports.mergeABI = mergeABI;
 exports.to_address = to_address;
