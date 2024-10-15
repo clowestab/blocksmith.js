@@ -976,6 +976,8 @@ class Foundry extends FoundryBase {
 		abi = mergeABI(abi, ...abis);
 		if (parseAllErrors) abi = this.parseAllErrors(abi);
 
+		console.log("Links", links);
+		
 		if (!this.isAnvil()) {
 			const deployment = await loadDeployment(this.root, chainId, prepend, contract);
 
@@ -984,6 +986,7 @@ class Foundry extends FoundryBase {
 
 				deployedContract.already = true;
 				deployedContract.constructorArgs = deployment.constructorArgs;
+				deployedContract.links = deployment.links;
 
 				return deployedContract;
 			}
@@ -1002,7 +1005,7 @@ class Foundry extends FoundryBase {
 				"target": receipt.contractAddress, 
 				"abi": abi, 
 				"bytecode": bytecode, 
-				"links": linked, 
+				"links": links, 
 				"receipt": receipt, 
 				"constructorArgs": args
 			};
@@ -1011,6 +1014,7 @@ class Foundry extends FoundryBase {
 
 		let c = new ethers.Contract(receipt.contractAddress, abi, from);
 		c["constructorArgs"] = args;
+		c["linked"] = linked;
 		c[Symbol_name] = `${contract}<${take_hash(c.target)}>`; // so we can deploy the same contract multiple times
 		c[Symbol_foundry] = this;
 		c.toString = get_NAME;
