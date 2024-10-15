@@ -977,7 +977,7 @@ class Foundry extends FoundryBase {
 		if (parseAllErrors) abi = this.parseAllErrors(abi);
 
 		console.log("Links", links);
-		
+
 		if (!this.isAnvil()) {
 			const deployment = await loadDeployment(this.root, chainId, prepend, contract);
 
@@ -1014,7 +1014,7 @@ class Foundry extends FoundryBase {
 
 		let c = new ethers.Contract(receipt.contractAddress, abi, from);
 		c["constructorArgs"] = args;
-		c["linked"] = linked;
+		c["links"] = links;
 		c[Symbol_name] = `${contract}<${take_hash(c.target)}>`; // so we can deploy the same contract multiple times
 		c[Symbol_foundry] = this;
 		c.toString = get_NAME;
