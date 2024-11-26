@@ -984,7 +984,7 @@ class Foundry extends FoundryBase {
 			const deployment = await loadDeployment(this.root, chainId, prepend, contract);
 
 			if (deployment && 'target' in deployment) {
-				const deployedContract = new ethers.ethers.Contract(deployment.target, deployment.abi.fragments, from);
+				const deployedContract = new ethers.ethers.Contract(deployment.target, deployment.abi, from);
 
 				deployedContract.already = true;
 				deployedContract.constructorArgs = deployment.constructorArgs;
@@ -1005,7 +1005,9 @@ class Foundry extends FoundryBase {
 			const contractData = {
 				"name": contract, 
 				"target": receipt.contractAddress, 
-				"abi": abi, 
+				// Save the minimal ABI
+				// 20241025 ethers.js was failing to parse complex tuple arrays when using fragments
+				"abi": abi.format(true), 
 				"bytecode": bytecode, 
 				"links": links, 
 				"receipt": receipt, 
